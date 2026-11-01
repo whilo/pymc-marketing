@@ -11,6 +11,8 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+from itertools import product
+
 import numpy as np
 import pymc as pm
 import pytensor
@@ -142,6 +144,32 @@ class TestParetoNBD:
             prior = pm.sample_prior_predictive(draws=100)
 
         assert prior["prior"]["pareto_nbd"][0].shape == (100, *expected_size)
+
+
+def _bgbb_joint_pmf_reference(alpha, beta, gamma, delta, T):
+    """Enumerate the finite generative process, independently of logp and RNG.
+
+    The active lifetime is capped at T: m < T means dropout before opportunity
+    m + 1, while m == T includes everyone alive through the observation window.
+    Enumerating all binary histories is practical only for small T.
+    """
+    mass = {(0, 0): 0.0}
+    mass.update({(r, x): 0.0 for r in range(1, T + 1) for x in range(1, r + 1)})
+    for m in range(T + 1):
+        lifetime_prob = np.exp(
+            betaln(gamma + (m < T), delta + m) - betaln(gamma, delta)
+        )
+        for history in product((0, 1), repeat=m):
+            frequency = sum(history)
+            recency = max(
+                (t for t, purchase in enumerate(history, start=1) if purchase),
+                default=0,
+            )
+            history_prob = np.exp(
+                betaln(alpha + frequency, beta + m - frequency) - betaln(alpha, beta)
+            )
+            mass[recency, frequency] += lifetime_prob * history_prob
+    return np.array(list(mass)), np.array(list(mass.values()))
 
 
 class TestBetaGeoBetaBinom:
@@ -369,6 +397,33 @@ class TestBetaGeoBetaBinom:
         for name, (sample, expected) in exact.items():
             se = sample.std() / np.sqrt(draws)
             assert abs(sample.mean() - expected) < 5 * se, name
+
+    @pytest.mark.parametrize(
+        "alpha, beta, gamma, delta",
+        [(1.204, 0.750, 0.657, 2.783), (2.0, 2.0, 0.5, 20.0)],
+        ids=["donations", "low-dropout"],
+    )
+    def test_rng_fn_matches_exact_joint_distribution(self, alpha, beta, gamma, delta):
+        # T=6 keeps enumeration small and gives all 22 joint cells ample mass.
+        T, n_draws = 6, 30_000
+        states, probabilities = _bgbb_joint_pmf_reference(alpha, beta, gamma, delta, T)
+        np.testing.assert_allclose(probabilities.sum(), 1.0, rtol=0, atol=1e-12)
+        expected = n_draws * probabilities
+        assert (expected >= 5).all()
+
+        draws = pm.draw(
+            BetaGeoBetaBinom.dist(
+                alpha=alpha, beta=beta, gamma=gamma, delta=delta, T=T, size=n_draws
+            ),
+            random_seed=20261101,
+        )
+        counts = np.array([np.all(draws == state, axis=1).sum() for state in states])
+        # Every draw must match one valid pair; do not discard out-of-support
+        # draws or flatten the two coordinates into separate histogram entries.
+        assert counts.sum() == n_draws
+        _, pvalue = scipy.stats.chisquare(counts, expected)
+        # Conservative fixed threshold limits stochastic failures in CI.
+        assert pvalue > 1e-6
 
 
 def _bg_nbd_rng_fn_reference(rng, a, b, r, alpha, T, size):
