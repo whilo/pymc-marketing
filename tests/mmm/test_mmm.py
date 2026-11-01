@@ -8822,3 +8822,335 @@ def test_fit_after_prior_predictive_with_target_does_not_warn(
         mmm.fit(X, y, chains=1, draws=10, tune=10, random_seed=42)
 
     assert not any("placeholder" in str(r.message) for r in records)
+
+
+# Calibration round trips exercise the rebuilt numerical graph, not sampling
+# convergence. The mocked sampling fixture supplies valid parameter draws.
+def _cpt_persistence_inputs(link="identity", labeled=False):
+    from pymc_marketing.mmm.data_conversion import to_mmm_dataset
+
+    dates = pd.date_range("2025-01-05", periods=6, freq="W")
+    X = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "week": dates,
+                    "geo": geo,
+                    "zeta": np.arange(1, 7, dtype=float) + i,
+                    "alpha": np.arange(6, 0, -1, dtype=float) + i,
+                }
+            )
+            for i, geo in enumerate(["001", "002"])
+        ],
+        ignore_index=True,
+    )
+    y = pd.Series(30 + 2 * X.zeta + X.alpha, name="target")
+    spend = X.assign(zeta=11 * X.zeta, alpha=7 * X.alpha)
+    mmm = MMM(
+        date_column="week",
+        target_column="target",
+        channel_columns=["zeta", "alpha"],
+        dims=("geo",),
+        adstock=GeometricAdstock(l_max=2),
+        saturation=LogisticSaturation(),
+        link=link,
+    )
+    if labeled:
+        options = dict(
+            date_column="week", dims=("geo",), channel_columns=["zeta", "alpha"]
+        )
+        X = to_mmm_dataset(X, y, **options).sel(geo=["002", "001"])
+        spend = to_mmm_dataset(spend, **options).sel(geo=["002", "001"])
+        y = None
+    mmm.build_model(X, y)
+    rows = pd.DataFrame(
+        {
+            "geo": ["002", "001"],
+            "channel": ["alpha", "zeta"],
+            "estimate": [2.0, 1.2345678901234567],
+            "sigma": [0.3, 0.4],
+        }
+    )
+    return mmm, X, y, spend, rows
+
+
+def _attach_cpt(mmm, spend, rows, name="external", roas=False, central="mean"):
+    return mmm.add_cost_per_target_calibration(
+        data=spend,
+        calibration_data=rows,
+        name_prefix=name,
+        target_column="estimate",
+        target_per_cost=roas,
+        central_tendency=central,
+    )
+
+
+@pytest.mark.parametrize(
+    "link,central,roas,mixed,labeled,prefix,suffix",
+    [
+        ("identity", "mean", False, False, False, "external", ".nc"),
+        ("identity", "mean", True, False, False, "external", ".nc"),
+        ("identity", "mean", False, True, False, "external", ".nc"),
+        ("log", "mean", True, False, False, "external", ".nc"),
+        ("log", "median", True, False, False, "external", ".nc"),
+        ("identity", "mean", False, False, True, "external", ".nc"),
+        ("identity", "mean", False, False, False, "y_original_scale", ".nc"),
+        ("identity", "mean", True, False, False, "external", ".zarr"),
+    ],
+    ids=[
+        "cpt",
+        "roas",
+        "mixed",
+        "log-mean",
+        "log-median",
+        "label-order",
+        "suffix-prefix",
+        "zarr",
+    ],
+)
+def test_cost_per_target_persistence_roundtrip(
+    mock_pymc_sample, tmp_path, link, central, roas, mixed, labeled, prefix, suffix
+):
+    mmm, X, y, spend, rows = _cpt_persistence_inputs(link, labeled)
+    _attach_cpt(mmm, spend, rows, prefix, roas, central)
+    if mixed:
+        _attach_cpt(mmm, spend, rows, "second", True)
+        mmm.add_lift_test_measurements(
+            pd.DataFrame(
+                {
+                    "geo": ["001"],
+                    "channel": ["zeta"],
+                    "x": [1.0],
+                    "delta_x": [1.0],
+                    "delta_y": [0.5],
+                    "sigma": [0.3],
+                }
+            ),
+            name="lift_external",
+        )
+    mmm.fit(X, y)
+    point = mmm.model.initial_point()
+    points = [point, {k: np.asarray(v) + 0.17 for k, v in point.items()}]
+    original_logp = mmm.model.compile_logp()
+    original_grad = mmm.model.compile_dlogp()
+    path = str(tmp_path / f"calibrated{suffix}")
+    mmm.save(path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = MMM.load(path)
+    assert not any("already in the model, skipping" in str(w.message) for w in caught)
+    assert {v.name for v in loaded.model.observed_RVs} == {
+        v.name for v in mmm.model.observed_RVs
+    }
+    assert loaded._cost_per_target_calibrations == mmm._cost_per_target_calibrations
+    assert loaded.model.coords["geo"] == mmm.model.coords["geo"]
+    assert loaded.model.coords["channel"] == ("zeta", "alpha")
+    restored_logp = loaded.model.compile_logp()
+    restored_grad = loaded.model.compile_dlogp()
+    observed_logps = [
+        (
+            loaded.model.compile_logp(vars=[loaded.model[rv.name]]),
+            mmm.model.compile_logp(vars=[rv]),
+        )
+        for rv in mmm.model.observed_RVs
+    ]
+    for p in points:
+        np.testing.assert_allclose(
+            restored_logp(p), original_logp(p), rtol=1e-11, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            restored_grad(p), original_grad(p), rtol=1e-11, atol=1e-8
+        )
+        for restored, original in observed_logps:
+            np.testing.assert_allclose(
+                restored(p),
+                original(p),
+                rtol=1e-11,
+                atol=1e-8,
+            )
+
+
+def test_cost_per_target_persistence_owns_inputs_and_resets():
+    mmm, X, y, spend, rows = _cpt_persistence_inputs()
+    # Irrelevant, non-serializable values must not enter the persisted inputs.
+    rows["unused"] = [object(), object()]
+    _attach_cpt(mmm, spend, rows)
+    record = copy.deepcopy(mmm._cost_per_target_calibrations)
+    rows.loc[:, "estimate"] = 99
+    spend.loc[:, "zeta"] = 999
+    assert mmm._cost_per_target_calibrations == record
+    assert record[0]["measurements"]["estimate"]["values"][1] == 1.2345678901234567
+    assert "unused" not in record[0]["measurements"]
+    with pytest.warns(UserWarning, match="already exist"):
+        _attach_cpt(mmm, spend, rows)
+    assert mmm._cost_per_target_calibrations == record
+    mmm.build_model(X, y)
+    assert mmm._cost_per_target_calibrations == []
+
+
+def test_cost_per_target_persistence_serialization_precedes_graph_changes(monkeypatch):
+    import pymc_marketing.mmm.mmm as mmm_module
+
+    mmm, _, _, spend, rows = _cpt_persistence_inputs()
+    names = set(mmm.model.named_vars)
+    coords = dict(mmm.model.coords)
+    original = mmm_module._calibration_array_to_dict
+
+    def invalid_record(values):
+        return {**original(values), "unsupported": object()}
+
+    monkeypatch.setattr(mmm_module, "_calibration_array_to_dict", invalid_record)
+    with pytest.raises(TypeError, match="JSON serializable"):
+        _attach_cpt(mmm, spend, rows)
+    assert set(mmm.model.named_vars) == names
+    assert mmm.model.coords == coords
+    assert mmm._cost_per_target_calibrations == []
+
+
+def test_cost_per_target_persistence_fit_snapshot(mock_pymc_sample, tmp_path):
+    mmm, X, y, spend, rows = _cpt_persistence_inputs()
+    _attach_cpt(mmm, spend, rows)
+    mmm.fit(X, y)
+    fitted_metadata = mmm.idata.attrs["cost_per_target_calibrations"]
+    _attach_cpt(mmm, spend, rows, "late")
+    path = str(tmp_path / "snapshot.nc")
+    mmm.save(path)
+    assert mmm.idata.attrs["cost_per_target_calibrations"] == fitted_metadata
+    assert "late" not in MMM.load(path).model
+    mmm.fit(X, y)
+    path = str(tmp_path / "refitted.nc")
+    mmm.save(path)
+    loaded = MMM.load(path)
+    assert "late" in loaded.model
+    assert len(loaded._cost_per_target_calibrations) == 2
+    legacy = copy.deepcopy(mmm.idata)
+    del legacy.attrs["cost_per_target_calibrations"]
+    assert MMM.load_from_idata(legacy)._cost_per_target_calibrations == []
+    bad = copy.deepcopy(mmm.idata)
+    records = json.loads(bad.attrs["cost_per_target_calibrations"])
+    records[0]["format_version"] = 99
+    bad.attrs["cost_per_target_calibrations"] = json.dumps(records)
+    with pytest.raises(
+        ValueError, match="Unsupported cost-per-target calibration format version"
+    ):
+        MMM.load_from_idata(bad)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([1.2345678901234567, 1e-20], dtype="float64"),
+        np.array([1.25], dtype="float32"),
+        np.array([2, 1], dtype="int32"),
+        np.array(["002", "001"]),
+        np.array(["002", "001"], dtype=object),
+        np.array(["2025-01-01T00:00:00.000000001"], dtype="datetime64[ns]"),
+        np.array([1, 2], dtype="timedelta64[ns]"),
+    ],
+)
+def test_cost_per_target_persistence_array_precision(values):
+    from pymc_marketing.mmm.mmm import (
+        _calibration_array_from_dict,
+        _calibration_array_to_dict,
+    )
+
+    encoded = json.loads(json.dumps(_calibration_array_to_dict(values)))
+    restored = _calibration_array_from_dict(encoded)
+    assert restored.dtype == values.dtype
+    np.testing.assert_array_equal(restored, values)
+
+
+@pytest.mark.parametrize("payload", ["{}", "[{}]", "[1]", "not json"])
+def test_cost_per_target_persistence_rejects_malformed_metadata(
+    mock_pymc_sample, payload
+):
+    mmm, X, y, _, _ = _cpt_persistence_inputs()
+    mmm.fit(X, y)
+    idata = copy.deepcopy(mmm.idata)
+    idata.attrs["cost_per_target_calibrations"] = payload
+    with pytest.raises(
+        ValueError, match="Invalid cost-per-target calibration metadata"
+    ):
+        MMM.load_from_idata(idata)
+
+
+def test_cost_per_target_persistence_normalizes_numeric_objects():
+    from decimal import Decimal
+
+    mmm, _, _, spend, rows = _cpt_persistence_inputs()
+    rows["estimate"] = rows["estimate"].map(lambda v: Decimal(str(v)))
+    rows["sigma"] = rows["sigma"].astype(str)
+    _attach_cpt(mmm, spend, rows)
+    record = mmm._cost_per_target_calibrations[0]
+    assert record["measurements"]["estimate"]["values"] == [2.0, 1.2345678901234567]
+    assert record["measurements"]["sigma"]["values"] == [0.3, 0.4]
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        [np.int64(1), np.int64(2)],
+        [np.float32(1), np.float32(2)],
+        [pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-02")],
+    ],
+    ids=["numpy-integer", "numpy-float", "pandas-timestamp"],
+)
+def test_cost_per_target_persistence_object_selectors(
+    mock_pymc_sample, tmp_path, labels
+):
+    mmm, X, y, spend, rows = _cpt_persistence_inputs()
+    mapping = dict(zip(["001", "002"], labels, strict=True))
+    X["geo"] = X["geo"].map(mapping)
+    spend["geo"] = spend["geo"].map(mapping)
+    # Explicit object dtype retains NumPy/pandas scalar objects, as accepted
+    # by the calibration API before persistence was added.
+    rows["geo"] = pd.Series([labels[1], labels[0]], dtype=object)
+    mmm.build_model(X, y)
+    _attach_cpt(mmm, spend, rows, roas=np.bool_(True))
+    mmm.fit(X, y)
+    point = mmm.model.initial_point()
+    points = [point, {k: np.asarray(v) + 0.17 for k, v in point.items()}]
+    original_logp = mmm.model.compile_logp()
+    original_grad = mmm.model.compile_dlogp()
+    path = str(tmp_path / "object-selectors.nc")
+    mmm.save(path)
+    loaded = MMM.load(path)
+    np.testing.assert_array_equal(loaded.model.coords["geo"], mmm.model.coords["geo"])
+    assert loaded._cost_per_target_calibrations[0]["target_per_cost"] is True
+    loaded_logp = loaded.model.compile_logp()
+    loaded_grad = loaded.model.compile_dlogp()
+    for p in points:
+        np.testing.assert_allclose(
+            loaded_logp(p), original_logp(p), rtol=1e-11, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            loaded_grad(p), original_grad(p), rtol=1e-11, atol=1e-8
+        )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.array([np.int64(1), np.float32(0.5), np.bool_(True)], dtype=object),
+        np.array([pd.Timestamp("2024-01-01T00:00:00.000000001")], dtype=object),
+        np.array([np.datetime64("2024-01-01T00:00:00.000000001", "ns")], dtype=object),
+        np.array([np.timedelta64(1, "ns")], dtype=object),
+        np.array(
+            [pd.Timestamp("2024-01-01T00:00:00.000000001", tz="Europe/Berlin")],
+            dtype=object,
+        ),
+    ],
+)
+def test_cost_per_target_persistence_object_scalar_precision(values):
+    from pymc_marketing.mmm.mmm import (
+        _calibration_array_from_dict,
+        _calibration_array_to_dict,
+    )
+
+    encoded = json.loads(json.dumps(_calibration_array_to_dict(values)))
+    restored = _calibration_array_from_dict(encoded)
+    assert restored.dtype == values.dtype
+    np.testing.assert_array_equal(restored, values)
+    # Check nanosecond ticks explicitly as well as scalar equality.
+    if isinstance(values[0], pd.Timestamp):
+        assert restored[0].value == values[0].value

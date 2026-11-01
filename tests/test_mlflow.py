@@ -1695,3 +1695,24 @@ def test_mlflow_docstrings_have_no_removed_methods(doc_source):
     """
     assert doc_source is not None
     assert "plot_components_contributions" not in doc_source
+
+
+@pytest.mark.parametrize("records", ["[]", '[{"spend": "' + "x" * 10000 + '"}]'])
+def test_log_mmm_configuration_cost_per_target_artifact(mmm, mocker, records):
+    mocker.patch.object(
+        mmm,
+        "create_idata_attrs",
+        return_value={
+            "model_config": "{}",
+            "cost_per_target_calibrations": records,
+        },
+    )
+    log_params = mocker.patch.object(pmm_mlflow.mlflow, "log_params")
+    mocker.patch.object(pmm_mlflow.mlflow, "log_param")
+    log_text = mocker.patch.object(pmm_mlflow.mlflow, "log_text")
+    pmm_mlflow.log_mmm_configuration(mmm)
+    log_params.assert_called_once_with({"model_config": "{}"})
+    if records == "[]":
+        log_text.assert_not_called()
+    else:
+        log_text.assert_called_once_with(records, "cost_per_target_calibrations.json")

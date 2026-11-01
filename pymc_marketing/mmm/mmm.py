@@ -300,6 +300,49 @@ def _deserialize_cost_per_unit(json_str: str) -> pd.DataFrame:
     return df
 
 
+def _calibration_array_to_dict(values: npt.NDArray) -> dict[str, Any]:
+    """Snapshot calibration values, retaining dtype and temporal precision."""
+    array = np.asarray(values)
+    if array.dtype.kind == "O":
+        array = array.copy()
+        for index, value in np.ndenumerate(array):
+            if isinstance(value, pd.Timestamp):
+                array[index] = {"timestamp": value.isoformat()}
+            elif isinstance(value, (np.datetime64, np.timedelta64)):
+                array[index] = {
+                    "temporal_dtype": str(value.dtype),
+                    "ticks": int(value.astype("int64")),
+                }
+            elif isinstance(value, np.generic):
+                array[index] = value.item()
+    return {
+        "dtype": str(array.dtype),
+        "values": (
+            array.astype("int64").tolist()
+            if array.dtype.kind in "mM"
+            else array.tolist()
+        ),
+    }
+
+
+def _calibration_array_from_dict(record: dict[str, Any]) -> npt.NDArray:
+    """Restore arrays written by :func:`_calibration_array_to_dict`."""
+    dtype = np.dtype(record["dtype"])
+    if dtype.kind in "mM":
+        return np.asarray(record["values"], dtype="int64").astype(dtype)
+    array = np.asarray(record["values"], dtype=dtype)
+    if dtype.kind == "O":
+        for index, value in np.ndenumerate(array):
+            if isinstance(value, dict):
+                if "timestamp" in value:
+                    array[index] = pd.Timestamp(value["timestamp"])
+                else:
+                    array[index] = np.asarray(value["ticks"], dtype="int64").astype(
+                        value["temporal_dtype"]
+                    )[()]
+    return array
+
+
 _EVALUATOR_CACHE_ATTR = "_incrementality_evaluators"
 """Instance attribute holding the compiled incrementality evaluators of an MMM.
 
@@ -697,6 +740,7 @@ class MMM(RegressionModelBuilder):
 
         self.mu_effects: list[MuEffect] = []
         self._lift_test_calibrations: list[dict[str, Any]] = []
+        self._cost_per_target_calibrations: list[dict[str, Any]] = []
 
     def add_mu_effect(
         self: Self,
@@ -1123,6 +1167,9 @@ class MMM(RegressionModelBuilder):
         attrs["link"] = self.link.value
         attrs["scaling"] = json.dumps(serialization.serialize(self.scaling))
         attrs["lift_test_calibrations"] = json.dumps(self._lift_test_calibrations)
+        attrs["cost_per_target_calibrations"] = json.dumps(
+            self._cost_per_target_calibrations
+        )
         attrs["dag"] = json.dumps(getattr(self, "dag", None))
         attrs["treatment_nodes"] = json.dumps(getattr(self, "treatment_nodes", None))
         attrs["outcome_node"] = json.dumps(getattr(self, "outcome_node", None))
@@ -2597,6 +2644,7 @@ class MMM(RegressionModelBuilder):
         # Calibration rows belong to a particular graph. A rebuild creates a
         # fresh graph, so callers must re-add any lift tests they want to use.
         self._lift_test_calibrations = []
+        self._cost_per_target_calibrations = []
         self._generate_and_preprocess_model_data(
             X=X,
             y=y,
@@ -4363,7 +4411,7 @@ class MMM(RegressionModelBuilder):
 
     def add_cost_per_target_calibration(
         self: Self,
-        data: pd.DataFrame,
+        data: pd.DataFrame | xr.Dataset | xr.DataArray,
         calibration_data: pd.DataFrame,
         name_prefix: str = "cpt_calibration",
         *,
@@ -4433,10 +4481,11 @@ class MMM(RegressionModelBuilder):
 
         Parameters
         ----------
-        data : pd.DataFrame
-            Feature-like DataFrame with columns matching training ``X`` but with
+        data : pd.DataFrame | xr.Dataset | xr.DataArray
+            Feature-like input with columns matching training ``X`` but with
             channel values representing spend (original units). Must include the
-            same ``date`` and any model ``dims`` columns.
+            same dates and model dimension labels as the training data.
+            Labeled xarray input preserves its coordinate order.
         calibration_data : pd.DataFrame
             DataFrame with rows specifying calibration targets. Must include:
 
@@ -4508,6 +4557,11 @@ class MMM(RegressionModelBuilder):
         -----
         Every error is raised before the increment node is registered, so a
         refused call leaves the model unchanged.
+
+        Calibration inputs and options are saved with the inference data when
+        fitting, and restored by :meth:`load`. Adding calibration after a fit
+        changes the graph but does not update the saved posterior or its
+        calibration metadata; refit before saving that change.
 
         Examples
         --------
@@ -4602,7 +4656,7 @@ class MMM(RegressionModelBuilder):
         # The checks add_cost_per_target_observations makes (sigma column,
         # channel and dim labels, numeric values), run here first so a bad
         # table is refused before the increment node is registered.
-        validate_cost_per_target_rows(
+        indices, targets, sigmas = validate_cost_per_target_rows(
             calibration_data, self.model, target_column=target_column
         )
 
@@ -4631,6 +4685,48 @@ class MMM(RegressionModelBuilder):
                     f"expected {model_labels.tolist()}, got {spend_labels.tolist()}"
                 )
 
+        # Snapshot only inputs consumed by this likelihood. Check serialization
+        # before registering nodes, and retain canonical spend so xarray label
+        # order is not lost through a DataFrame round trip.
+        columns = dict.fromkeys(["channel", *self.dims, target_column, "sigma"])
+        measurements = {
+            column: calibration_data[column].to_numpy() for column in columns
+        }
+        # The likelihood consumes float arrays, including when users supply
+        # numeric strings, Decimal values, or nullable pandas numeric columns.
+        # Retain original values where a measurement column also supplies labels.
+        labels = {"channel", *self.dims}
+        for column in labels:
+            # Save the labels already matched by the validator, in their native
+            # coordinate dtype. In particular, object Timestamp selectors must
+            # become temporal arrays to compare correctly after a NetCDF load.
+            measurements[column] = pd.Series(self.model.coords[column]).to_numpy()[
+                indices[column]
+            ]
+        for column, values in ((target_column, targets), ("sigma", sigmas)):
+            if column not in labels:
+                measurements[column] = values
+        calibration = {
+            "format_version": 1,
+            "name_prefix": name_prefix,
+            "target_column": target_column,
+            "target_per_cost": bool(target_per_cost),
+            "central_tendency": central_tendency,
+            "spend": {
+                "dims": list(spend_xarray.dims),
+                "data": _calibration_array_to_dict(spend_xarray.values),
+                "coords": {
+                    dim: _calibration_array_to_dict(spend_xarray.coords[dim].values)
+                    for dim in spend_xarray.dims
+                },
+            },
+            "measurements": {
+                column: _calibration_array_to_dict(values)
+                for column, values in measurements.items()
+            },
+        }
+        json.dumps(calibration, allow_nan=False)
+
         # Built before the increment is registered, so a model that cannot give
         # the mean scale fails without changing the graph.
         mean_ratio = (
@@ -4653,6 +4749,8 @@ class MMM(RegressionModelBuilder):
             name_prefix=name_prefix,
             target_per_cost=target_per_cost,
         )
+
+        self._cost_per_target_calibrations.append(calibration)
 
         return self
 
@@ -4867,8 +4965,9 @@ class MMM(RegressionModelBuilder):
             the posterior. Posterior draws are matched to the model by position,
             and a model fit from an ``xr.Dataset`` keeps the Dataset's order,
             while the DataFrame built from ``fit_data`` is sorted.
-        - Restores lift-test calibration. Cost-per-target calibration is not
-            currently restored because its input data are not saved.
+        - Restores lift-test and cost-per-target/ROAS calibration when their
+            input records are present. Older files without those records cannot
+            reconstruct the missing calibration likelihoods.
 
         Examples
         --------
@@ -4941,6 +5040,46 @@ class MMM(RegressionModelBuilder):
                     name=calibration["name"],
                 )
 
+        try:
+            calibrations = json.loads(
+                idata.attrs.get("cost_per_target_calibrations", "[]")
+            )
+            if not isinstance(calibrations, list):
+                raise ValueError("Expected a list of calibration records")
+            for calibration in calibrations:
+                if calibration.get("format_version") != 1:
+                    raise ValueError(
+                        "Unsupported cost-per-target calibration format version: "
+                        f"{calibration.get('format_version')!r}"
+                    )
+                spend = calibration["spend"]
+                spend_array = xr.DataArray(
+                    _calibration_array_from_dict(spend["data"]),
+                    dims=spend["dims"],
+                    coords={
+                        dim: _calibration_array_from_dict(coord)
+                        for dim, coord in spend["coords"].items()
+                    },
+                )
+                self.add_cost_per_target_calibration(
+                    data=spend_array.to_dataset(name="_channel"),
+                    calibration_data=pd.DataFrame(
+                        {
+                            column: _calibration_array_from_dict(values)
+                            for column, values in calibration["measurements"].items()
+                        }
+                    ),
+                    name_prefix=calibration["name_prefix"],
+                    target_column=calibration["target_column"],
+                    target_per_cost=calibration["target_per_cost"],
+                    central_tendency=calibration["central_tendency"],
+                )
+
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            raise ValueError(
+                f"Invalid cost-per-target calibration metadata: {error}"
+            ) from error
+
         # Re-add any *_original_scale Deterministics that were present when the
         # model was saved.  These are added by add_original_scale_contribution_variable
         # but the PyMC model graph is not serialized, so build_model does not know
@@ -4971,6 +5110,11 @@ class MMM(RegressionModelBuilder):
         else:
             vars_to_restore = []
 
+        vars_to_restore = [
+            var
+            for var in vars_to_restore
+            if f"{var}_original_scale" not in self.model.named_vars
+        ]
         if vars_to_restore:
             self.add_original_scale_contribution_variable(var=vars_to_restore)
 
